@@ -116,12 +116,18 @@ class ReviewOrchestrator:
             )
 
         # l. Render template
+        token_usage = {
+            "prompt_tokens": self._ai_reviewer.total_prompt_tokens,
+            "completion_tokens": self._ai_reviewer.total_completion_tokens,
+            "total_tokens": self._ai_reviewer.total_tokens,
+        }
         formatted_comment = self._template_engine.render(
             review_result,
             pr_info,
             diff_report,
             options.template_path,
             filter_result.excluded_files,
+            token_usage=token_usage,
         )
 
         # m. Save record

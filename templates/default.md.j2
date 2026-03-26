@@ -78,45 +78,6 @@
 ✅ 未发现问题，代码质量良好。
 {% endif %}
 
-{% if diff_report %}
 ---
 
-### 📈 历史对比摘要
-
-与上次审查相比：
-
-| 分类 | 数量 |
-|------|------|
-| ✅ 已改进 | {{ diff_report.improved|length }} |
-| ⚠️ 未解决 | {{ diff_report.unresolved|length }} |
-| 🆕 新发现 | {{ diff_report.new_issues|length }} |
-
-{% if diff_report.improved|length > 0 %}
-#### ✅ 已改进的问题
-
-{% for item in diff_report.improved %}
-- ~~{{ item.description }}~~ → {{ item.resolution if item.resolution else "已修复" }}
-{% endfor %}
-{% endif %}
-
-{% if diff_report.unresolved|length > 0 %}
-#### ⚠️ 仍未解决的问题
-
-{% for item in diff_report.unresolved %}
-- {{ item.description }}（`{{ item.file_path }}`）
-{% endfor %}
-{% endif %}
-
-{% if diff_report.new_issues|length > 0 %}
-#### 🆕 本次新发现的问题
-
-{% for item in diff_report.new_issues %}
-- [{{ item.severity }}] {{ item.description }}（`{{ item.file_path }}`）
-{% endfor %}
-{% endif %}
-
-{% endif %}
-
----
-
-<sub>🤖 此审查由 AI 自动生成（PR Review System），仅供参考，请结合实际情况判断。</sub>
+<sub>🤖 此审查由 AI 自动生成（PR Review System），仅供参考，请结合实际情况判断。{% if token_usage %} | Token 消耗：输入 {{ token_usage.prompt_tokens }}，输出 {{ token_usage.completion_tokens }}，共计 {{ token_usage.total_tokens }}{% endif %}</sub>

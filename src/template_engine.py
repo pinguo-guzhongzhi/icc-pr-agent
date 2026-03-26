@@ -22,6 +22,7 @@ class TemplateEngine:
         diff_report: ReviewDiffReport | None = None,
         template_path: str | None = None,
         excluded_files: list[dict] | None = None,
+        token_usage: dict | None = None,
     ) -> str:
         """Render review result using a Jinja2 template.
 
@@ -57,4 +58,5 @@ class TemplateEngine:
             result=review_result,
             diff_report=diff_report,
             excluded_files=excluded_files,
+            token_usage=token_usage,
         )

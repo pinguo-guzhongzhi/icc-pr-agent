@@ -94,6 +94,10 @@ class AIReviewer:
         if config.llm_base_url:
             kwargs["base_url"] = config.llm_base_url
         self._llm = ChatOpenAI(**kwargs, timeout=120)
+        # Token usage tracking
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_tokens = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -231,6 +235,12 @@ class AIReviewer:
                     "调用 AI 模型 (尝试 %d/%d)", attempt + 1, _MAX_RETRIES
                 )
                 response = self._llm.invoke(prompt)
+                # Extract token usage from response metadata
+                usage = getattr(response, "usage_metadata", None)
+                if usage:
+                    self.total_prompt_tokens += usage.get("input_tokens", 0)
+                    self.total_completion_tokens += usage.get("output_tokens", 0)
+                    self.total_tokens += usage.get("total_tokens", 0)
                 return str(response.content)
             except Exception as exc:  # noqa: BLE001
                 last_error = exc

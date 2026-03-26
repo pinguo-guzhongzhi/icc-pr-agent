@@ -158,6 +158,9 @@ class ReviewOutput:
     diff_report: ReviewDiffReport | None
     formatted_comment: str
     written_back: bool
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 @dataclass
