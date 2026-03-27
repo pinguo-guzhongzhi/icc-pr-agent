@@ -140,13 +140,15 @@ async def _review_worker() -> None:
 
 
 async def _run_review(event: GitHubWebhookEvent) -> None:
-    """Execute the review in a background thread (blocking I/O)."""
+    """Execute the review on a dedicated single thread."""
     assert _orchestrator is not None
+    assert _review_executor is not None
     options = ReviewOptions(write_back=True)
+    loop = asyncio.get_running_loop()
 
     try:
-        output = await asyncio.to_thread(
-            _orchestrator.run, event.pr_url, options,
+        output = await loop.run_in_executor(
+            _review_executor, _orchestrator.run, event.pr_url, options,
         )
         logger.info(
             "Review done %s — issues=%d tokens=%d written_back=%s",

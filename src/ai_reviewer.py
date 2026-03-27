@@ -671,32 +671,15 @@ class AIReviewer:
                 f"{datetime.now(timezone.utc).timestamp()}"
             )
 
-            # Execute with timeout protection
-            timeout = self._config.review_timeout
-            import concurrent.futures
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    sub_agent.invoke,
-                    {
-                        "messages": [{"role": "user", "content": prompt}],
-                        "files": all_files,
-                    },
-                    config={"configurable": {"thread_id": thread_id}},
-                )
-                try:
-                    result = future.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
-                    future.cancel()
-                    elapsed = time.monotonic() - start_time
-                    error_msg = f"{group_name} 组审查超时（{timeout}s），已跳过"
-                    logger.error(error_msg)
-                    return SubAgentResult(
-                        group_name=group_name,
-                        batch_index=batch.batch_index,
-                        result=None,
-                        error=error_msg,
-                        elapsed_seconds=elapsed,
-                    )
+            # Execute directly (no nested thread pool — thread budget is managed
+            # by the outer ThreadPoolExecutor in _review_with_subagents).
+            result = sub_agent.invoke(
+                {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "files": all_files,
+                },
+                config={"configurable": {"thread_id": thread_id}},
+            )
 
             # Parse response
             messages = result.get("messages", [])
