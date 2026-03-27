@@ -9,6 +9,7 @@ Mounts:
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -46,6 +47,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _config = Config.from_env()
     _orchestrator = ReviewOrchestrator(_config)
     _record_store = RecordStore(_config.review_storage_dir)
+    # Limit the default executor to avoid "can't start new thread" in containers.
+    # Sub-agent concurrency already uses its own pool, so 1 thread here is enough.
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
     _worker_task = asyncio.create_task(_review_worker())
     logger.info("Server started")
     yield
