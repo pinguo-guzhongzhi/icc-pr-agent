@@ -162,11 +162,53 @@ class AIReviewer:
         self._result_merger = ResultMerger()
         # Per-group token usage (populated after sub-agent review)
         self._token_usage_by_group: list[TokenUsageByGroup] = []
+        # Trace data for each agent invocation
+        self._traces: list[dict] = []
 
     @property
     def token_usage_by_group(self) -> list[TokenUsageByGroup]:
         """Per-group token consumption after sub-agent review."""
         return self._token_usage_by_group
+
+    @property
+    def traces(self) -> list[dict]:
+        """Trace data from all agent invocations."""
+        return self._traces
+
+    def _dump_messages(self, messages: list, group_name: str, batch_index: int) -> None:
+        """Build trace data from message chain and store internally."""
+        trace = {
+            "group_name": group_name,
+            "batch_index": batch_index,
+            "message_count": len(messages),
+            "messages": [],
+        }
+        for i, msg in enumerate(messages):
+            role = getattr(msg, "type", "unknown")
+            content = getattr(msg, "content", "")
+            content_str = str(content)
+            tool_calls = []
+            # Extract tool calls from ai messages
+            if hasattr(msg, "tool_calls"):
+                for tc in (msg.tool_calls or []):
+                    tool_calls.append({
+                        "name": tc.get("name", ""),
+                        "args": {k: str(v)[:200] for k, v in tc.get("args", {}).items()},
+                    })
+            entry = {
+                "index": i,
+                "role": role,
+                "char_count": len(content_str),
+                "content_preview": content_str[:300] + ("..." if len(content_str) > 300 else ""),
+            }
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
+            # Token usage on last message
+            usage = getattr(msg, "usage_metadata", None)
+            if usage:
+                entry["usage_metadata"] = dict(usage)
+            trace["messages"].append(entry)
+        self._traces.append(trace)
 
     def _build_model_string(self) -> str:
         """Build the provider:model string for init_chat_model."""
@@ -410,6 +452,9 @@ class AIReviewer:
         # Optional symbol index
         symbol_index = self._build_symbol_index(pr_info)
 
+        # Resolve repo directory for source file access
+        repo_dir = self._resolve_repo_dir(pr_info)
+
         # Concurrent sub-agent execution
         max_concurrency = self._config.max_concurrency
         sub_results: list[SubAgentResult] = []
@@ -423,6 +468,7 @@ class AIReviewer:
                     batch,
                     symbol_index,
                     pr_info,
+                    repo_dir,
                 ): batch
                 for batch in all_batches
             }
@@ -514,6 +560,40 @@ class AIReviewer:
             logger.warning("符号索引构建失败，子 Agent 将不提供 lookup_symbol tool: %s", exc)
             return None
 
+    def _resolve_repo_dir(self, pr_info: PRInfo) -> str | None:
+        """Resolve the persistent repo directory for source file access."""
+        repo_url = self._extract_repo_url(pr_info)
+        if not repo_url:
+            return None
+        indexer = SymbolIndexer(cache_dir=self._config.review_storage_dir)
+        repo_dir = indexer._repo_dir_path(repo_url)
+        if os.path.isdir(repo_dir):
+            return repo_dir
+        return None
+
+    @staticmethod
+    def _load_source_files(
+        repo_dir: str | None, file_paths: list[str],
+    ) -> dict:
+        """Load source files from the cloned repo into StateBackend format."""
+        source_files = {}
+        if not repo_dir:
+            return source_files
+        for rel_path in file_paths:
+            full_path = os.path.join(repo_dir, rel_path)
+            if not os.path.isfile(full_path):
+                continue
+            try:
+                content = open(full_path, encoding="utf-8").read()
+                # Use the repo-relative path as the virtual path
+                virtual_path = f"/{rel_path}"
+                source_files[virtual_path] = create_file_data(content)
+            except Exception as exc:
+                logger.warning("无法读取源文件 %s: %s", full_path, exc)
+        if source_files:
+            logger.info("已加载 %d 个源文件供 Agent 参考", len(source_files))
+        return source_files
+
     @staticmethod
     def _extract_repo_url(pr_info: PRInfo) -> str | None:
         """Extract clone URL from PR URL."""
@@ -542,12 +622,17 @@ class AIReviewer:
         batch: Batch,
         symbol_index: SymbolIndex | None,
         pr_info: PRInfo,
+        repo_dir: str | None = None,
     ) -> SubAgentResult:
         """Create and execute a single sub-agent review task with timeout protection."""
         start_time = time.monotonic()
         try:
             model = self._create_model()
             skills_files = self._load_skills_files()
+
+            # Load source files for the batch from cloned repo
+            source_files = self._load_source_files(repo_dir, batch.file_paths)
+            all_files = {**skills_files, **source_files}
 
             # Build sub-agent system prompt with group context
             sub_system_prompt = (
@@ -594,7 +679,7 @@ class AIReviewer:
                     sub_agent.invoke,
                     {
                         "messages": [{"role": "user", "content": prompt}],
-                        "files": skills_files,
+                        "files": all_files,
                     },
                     config={"configurable": {"thread_id": thread_id}},
                 )
@@ -617,6 +702,9 @@ class AIReviewer:
             messages = result.get("messages", [])
             if not messages:
                 raise AIModelError("Sub-agent 返回空消息")
+
+            # Dump full message chain for token analysis
+            self._dump_messages(messages, group_name, batch.batch_index)
 
             last_msg = messages[-1]
             content = (
@@ -730,6 +818,9 @@ class AIReviewer:
                 messages = result.get("messages", [])
                 if not messages:
                     raise AIModelError("DeepAgents 返回空消息")
+
+                # Dump full message chain for token analysis
+                self._dump_messages(messages, "single", 0)
 
                 last_msg = messages[-1]
                 content = (

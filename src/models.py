@@ -67,6 +67,7 @@ class ReviewRecord:
     completion_tokens: int = 0
     total_tokens: int = 0
     token_usage_by_group: list[TokenUsageByGroup] | None = None
+    trace: list[dict] | None = None
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict suitable for JSON storage."""
@@ -118,6 +119,7 @@ class ReviewRecord:
                 "total_tokens": self.total_tokens,
                 "by_group": token_by_group,
             },
+            "trace": self.trace,
             "created_at": self.created_at,
         }
 
@@ -175,6 +177,7 @@ class ReviewRecord:
             completion_tokens=tu.get("completion_tokens", 0),
             total_tokens=tu.get("total_tokens", 0),
             token_usage_by_group=by_group,
+            trace=data.get("trace"),
         )
 
 

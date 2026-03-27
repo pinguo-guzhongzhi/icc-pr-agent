@@ -145,6 +145,7 @@ class ReviewOrchestrator:
             completion_tokens=self._ai_reviewer.total_completion_tokens,
             total_tokens=self._ai_reviewer.total_tokens,
             token_usage_by_group=self._ai_reviewer.token_usage_by_group or None,
+            trace=self._ai_reviewer.traces or None,
         )
         self._record_store.save(record)
 

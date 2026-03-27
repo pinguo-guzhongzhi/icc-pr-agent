@@ -27,6 +27,7 @@ def _make_record(
     created_at: str = "2024-01-15T10:30:00",
     summary: str = "Looks good",
     diff_report: ReviewDiffReport | None = None,
+    trace: list[dict] | None = None,
 ) -> ReviewRecord:
     result = ReviewResult(
         summary=summary,
@@ -51,6 +52,7 @@ def _make_record(
         review_result=result,
         diff_report=diff_report,
         created_at=created_at,
+        trace=trace,
     )
 
 
@@ -59,57 +61,32 @@ def _make_record(
 # -------------------------------------------------------------------
 
 class TestRecordStoreSave:
-    """Tests for RecordStore.save."""
+    """Tests for RecordStore.save (single-file-per-PR)."""
 
     def test_save_creates_json_file(self, tmp_path):
         store = RecordStore(storage_dir=str(tmp_path))
-        record = _make_record()
-        store.save(record)
+        store.save(_make_record())
 
-        expected_dir = tmp_path / "github" / "owner" / "repo" / "prs" / "42"
-        assert expected_dir.is_dir()
+        pr_file = tmp_path / "github" / "owner" / "repo" / "prs" / "42.json"
+        assert pr_file.is_file()
 
-        json_files = list(expected_dir.glob("*.json"))
-        assert len(json_files) == 1
-
-        with open(json_files[0], "r", encoding="utf-8") as fh:
+        with open(pr_file, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        assert data["record_id"] == "rec-1"
-        assert data["pr_id"] == "owner/repo#42"
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["record_id"] == "rec-1"
 
-    def test_save_sanitizes_colons_in_filename(self, tmp_path):
+    def test_save_appends_to_existing(self, tmp_path):
         store = RecordStore(storage_dir=str(tmp_path))
-        record = _make_record(
-            created_at="2024-01-15T10:30:00",
-            version_id="abc123",
-        )
-        store.save(record)
+        store.save(_make_record(record_id="r1", created_at="2024-01-15T10:00:00"))
+        store.save(_make_record(record_id="r2", created_at="2024-01-16T14:00:00"))
 
-        pr_dir = tmp_path / "github" / "owner" / "repo" / "prs" / "42"
-        json_files = list(pr_dir.glob("*.json"))
-        assert len(json_files) == 1
-        assert json_files[0].name == (
-            "2024-01-15T10-30-00_abc123.json"
-        )
-
-    def test_save_multiple_records(self, tmp_path):
-        store = RecordStore(storage_dir=str(tmp_path))
-        r1 = _make_record(
-            record_id="r1",
-            created_at="2024-01-15T10:00:00",
-            version_id="v1",
-        )
-        r2 = _make_record(
-            record_id="r2",
-            created_at="2024-01-16T14:00:00",
-            version_id="v2",
-        )
-        store.save(r1)
-        store.save(r2)
-
-        pr_dir = tmp_path / "github" / "owner" / "repo" / "prs" / "42"
-        json_files = list(pr_dir.glob("*.json"))
-        assert len(json_files) == 2
+        pr_file = tmp_path / "github" / "owner" / "repo" / "prs" / "42.json"
+        with open(pr_file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        assert len(data) == 2
+        assert data[0]["record_id"] == "r1"
+        assert data[1]["record_id"] == "r2"
 
     def test_save_with_diff_report(self, tmp_path):
         store = RecordStore(storage_dir=str(tmp_path))
@@ -118,16 +95,22 @@ class TestRecordStoreSave:
             unresolved=[],
             new_issues=[],
         )
-        record = _make_record(diff_report=diff_report)
-        store.save(record)
+        store.save(_make_record(diff_report=diff_report))
 
-        pr_dir = tmp_path / "github" / "owner" / "repo" / "prs" / "42"
-        json_files = list(pr_dir.glob("*.json"))
-        with open(json_files[0], "r", encoding="utf-8") as fh:
+        pr_file = tmp_path / "github" / "owner" / "repo" / "prs" / "42.json"
+        with open(pr_file, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        assert data["diff_report"]["improved"] == [
-            {"issue": "fixed"},
-        ]
+        assert data[0]["diff_report"]["improved"] == [{"issue": "fixed"}]
+
+    def test_save_with_trace(self, tmp_path):
+        store = RecordStore(storage_dir=str(tmp_path))
+        trace = [{"group_name": "backend", "batch_index": 0, "message_count": 5}]
+        store.save(_make_record(trace=trace))
+
+        pr_file = tmp_path / "github" / "owner" / "repo" / "prs" / "42.json"
+        with open(pr_file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        assert data[0]["trace"] == trace
 
 
 # -------------------------------------------------------------------
@@ -142,25 +125,13 @@ class TestRecordStoreGetLatest:
         assert store.get_latest("owner/repo#42") is None
 
     def test_returns_none_when_dir_missing(self, tmp_path):
-        store = RecordStore(
-            storage_dir=str(tmp_path / "nonexistent"),
-        )
+        store = RecordStore(storage_dir=str(tmp_path / "nonexistent"))
         assert store.get_latest("owner/repo#42") is None
 
     def test_returns_most_recent_record(self, tmp_path):
         store = RecordStore(storage_dir=str(tmp_path))
-        r1 = _make_record(
-            record_id="r1",
-            created_at="2024-01-15T10:00:00",
-            version_id="v1",
-        )
-        r2 = _make_record(
-            record_id="r2",
-            created_at="2024-01-16T14:00:00",
-            version_id="v2",
-        )
-        store.save(r1)
-        store.save(r2)
+        store.save(_make_record(record_id="r1", created_at="2024-01-15T10:00:00"))
+        store.save(_make_record(record_id="r2", created_at="2024-01-16T14:00:00"))
 
         latest = store.get_latest("owner/repo#42")
         assert latest is not None
@@ -180,45 +151,18 @@ class TestRecordStoreGetHistory:
 
     def test_returns_sorted_ascending(self, tmp_path):
         store = RecordStore(storage_dir=str(tmp_path))
-        # Save in reverse order to verify sorting
-        r2 = _make_record(
-            record_id="r2",
-            created_at="2024-01-16T14:00:00",
-            version_id="v2",
-        )
-        r1 = _make_record(
-            record_id="r1",
-            created_at="2024-01-15T10:00:00",
-            version_id="v1",
-        )
-        r3 = _make_record(
-            record_id="r3",
-            created_at="2024-01-17T08:00:00",
-            version_id="v3",
-        )
-        store.save(r2)
-        store.save(r1)
-        store.save(r3)
+        store.save(_make_record(record_id="r2", created_at="2024-01-16T14:00:00"))
+        store.save(_make_record(record_id="r1", created_at="2024-01-15T10:00:00"))
+        store.save(_make_record(record_id="r3", created_at="2024-01-17T08:00:00"))
 
         history = store.get_history("owner/repo#42")
         assert len(history) == 3
-        ids = [r.record_id for r in history]
-        assert ids == ["r1", "r2", "r3"]
+        assert [r.record_id for r in history] == ["r1", "r2", "r3"]
 
     def test_latest_matches_last_history(self, tmp_path):
         store = RecordStore(storage_dir=str(tmp_path))
-        r1 = _make_record(
-            record_id="r1",
-            created_at="2024-01-15T10:00:00",
-            version_id="v1",
-        )
-        r2 = _make_record(
-            record_id="r2",
-            created_at="2024-01-16T14:00:00",
-            version_id="v2",
-        )
-        store.save(r1)
-        store.save(r2)
+        store.save(_make_record(record_id="r1", created_at="2024-01-15T10:00:00"))
+        store.save(_make_record(record_id="r2", created_at="2024-01-16T14:00:00"))
 
         history = store.get_history("owner/repo#42")
         latest = store.get_latest("owner/repo#42")
@@ -227,36 +171,19 @@ class TestRecordStoreGetHistory:
 
     def test_different_pr_ids_isolated(self, tmp_path):
         store = RecordStore(storage_dir=str(tmp_path))
-        r1 = _make_record(
-            record_id="r1",
-            pr_id="owner/repo#42",
-            version_id="v1",
-        )
-        r2 = _make_record(
-            record_id="r2",
-            pr_id="owner/repo#99",
-            version_id="v2",
-        )
-        store.save(r1)
-        store.save(r2)
+        store.save(_make_record(record_id="r1", pr_id="owner/repo#42"))
+        store.save(_make_record(record_id="r2", pr_id="owner/repo#99"))
 
-        h42 = store.get_history("owner/repo#42")
-        h99 = store.get_history("owner/repo#99")
-        assert len(h42) == 1
-        assert len(h99) == 1
-        assert h42[0].record_id == "r1"
-        assert h99[0].record_id == "r2"
+        assert len(store.get_history("owner/repo#42")) == 1
+        assert len(store.get_history("owner/repo#99")) == 1
+        assert store.get_history("owner/repo#42")[0].record_id == "r1"
+        assert store.get_history("owner/repo#99")[0].record_id == "r2"
 
-    def test_skips_invalid_json_files(self, tmp_path):
+    def test_handles_corrupt_file(self, tmp_path):
+        """Corrupt JSON file returns empty history without crashing."""
         store = RecordStore(storage_dir=str(tmp_path))
-        record = _make_record()
-        store.save(record)
+        pr_file = tmp_path / "github" / "owner" / "repo" / "prs" / "42.json"
+        pr_file.parent.mkdir(parents=True)
+        pr_file.write_text("not valid json", encoding="utf-8")
 
-        # Write a corrupt JSON file in the same PR directory
-        pr_dir = tmp_path / "github" / "owner" / "repo" / "prs" / "42"
-        corrupt = pr_dir / "corrupt.json"
-        corrupt.write_text("not valid json", encoding="utf-8")
-
-        history = store.get_history("owner/repo#42")
-        assert len(history) == 1
-        assert history[0].record_id == "rec-1"
+        assert store.get_history("owner/repo#42") == []
