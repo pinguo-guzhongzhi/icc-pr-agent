@@ -44,6 +44,7 @@ class Config:
     log_level: str = "INFO"
     review_storage_dir: str = ".pr_reviews"
     pr_review_exclude: list[str] = field(default_factory=list)
+    skills_dir: str = ""
 
     # Webhook secrets
     webhook_secret_github: str = ""
@@ -76,6 +77,7 @@ class Config:
                 "REVIEW_STORAGE_DIR", ".pr_reviews"
             ),
             pr_review_exclude=exclude_patterns,
+            skills_dir=os.environ.get("SKILLS_DIR", ""),
             webhook_secret_github=os.environ.get("WEBHOOK_SECRET_GITHUB", ""),
             webhook_secret_gitlab=os.environ.get("WEBHOOK_SECRET_GITLAB", ""),
             webhook_secret_codeup=os.environ.get(

@@ -1,0 +1,143 @@
+# PR Review 配置文件
+# 包含文件排除规则和 prompt 模板
+
+# ============================================================
+# 文件排除配置
+# 匹配的文件将跳过 AI 审查，支持 glob 模式
+# ============================================================
+exclude:
+  # 依赖锁文件
+  - "*.lock"
+  - "package-lock.json"
+  - "yarn.lock"
+  - "pnpm-lock.yaml"
+  - "go.sum"
+  - "Pipfile.lock"
+  - "poetry.lock"
+  - "composer.lock"
+  - "Gemfile.lock"
+  - "Cargo.lock"
+
+  # 图片和媒体
+  - "*.png"
+  - "*.jpg"
+  - "*.jpeg"
+  - "*.gif"
+  - "*.svg"
+  - "*.ico"
+  - "*.bmp"
+  - "*.webp"
+  - "*.mp4"
+  - "*.mp3"
+
+  # 字体
+  - "*.woff"
+  - "*.woff2"
+  - "*.ttf"
+  - "*.eot"
+  - "*.otf"
+
+  # 编译产物和压缩文件
+  - "*.min.js"
+  - "*.min.css"
+  - "*.map"
+  - "*.bundle.js"
+  - "*.chunk.js"
+  - "*.pyc"
+  - "*.class"
+  - "*.o"
+  - "*.so"
+  - "*.dll"
+  - "*.exe"
+  - "*.jar"
+  - "*.war"
+  - "*.zip"
+  - "*.tar.gz"
+  - "*.wasm"
+
+  # 自动生成的代码
+  - "*.pb.go"
+  - "*.pb.gw.go"
+  - "*_generated.go"
+  - "*_gen.go"
+  - "*.generated.ts"
+  - "*.swagger.json"
+  - "*.openapi.json"
+
+  # 文档和配置
+  - "*.md"
+  - "LICENSE"
+  - "LICENSE.*"
+  - ".gitignore"
+  - ".gitattributes"
+  - ".editorconfig"
+  - ".prettierrc"
+  - ".eslintignore"
+
+  # IDE 和编辑器
+  - ".idea/**"
+  - ".vscode/**"
+  - "*.iml"
+
+  # 目录级排除
+  - "vendor/**"
+  - "node_modules/**"
+  - "dist/**"
+  - "build/**"
+  - "__pycache__/**"
+  - ".next/**"
+  - "coverage/**"
+  - "third_party/**"
+
+  # 测试快照和 fixtures
+  - "**/__snapshots__/**"
+  - "**/testdata/**"
+  - "**/fixtures/**"
+
+# ============================================================
+# Prompt 模板配置
+# 支持变量: {title}, {description}, {source_branch},
+#           {target_branch}, {diff}, {summaries}
+# ============================================================
+prompts:
+  system_prompt: >
+    你是一位资深代码审查专家。请根据你掌握的技能，对代码变更进行专业审查，
+    严格按照 JSON 格式输出结果。
+
+  review_user_prompt: |
+    请对以下 Pull Request 的代码变更进行审查。
+
+    ## PR 信息
+    - 标题: {title}
+    - 描述: {description}
+    - 源分支: {source_branch}
+    - 目标分支: {target_branch}
+
+    ## 代码变更 (Diff)
+    ```
+    {diff}
+    ```
+
+    请使用你认为合适的技能进行审查，严格按照以下 JSON 格式输出结果，不要包含其他内容：
+    {{
+      "summary": "审查总结（一段简短的总体评价）",
+      "issues": [
+        {{
+          "file_path": "文件路径",
+          "line_number": 行号或null,
+          "severity": "critical|warning|suggestion",
+          "category": "quality|bug|security|improvement",
+          "description": "问题描述",
+          "suggestion": "改进建议或null"
+        }}
+      ]
+    }}
+
+  summary_user_prompt: |
+    以下是对一个 Pull Request 中多个文件分别审查后的结果摘要列表。
+    请将它们合并为一段简洁的总体审查总结（2-3 句话）。
+
+    各文件审查摘要：
+    {summaries}
+
+    请只输出总结文本，不要输出 JSON 或其他格式。

@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "AI-powered PR code review tool using LangChain DeepAgents"
 requires-python = ">=3.9"
 dependencies = [
+    "deepagents>=0.1",
     "langchain>=0.3",
     "langchain-openai>=0.3",
     "jinja2>=3.1",

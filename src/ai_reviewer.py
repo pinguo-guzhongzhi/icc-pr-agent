@@ -1,17 +1,23 @@
-"""AI code review engine using LangChain ChatOpenAI.
+"""AI code review engine using LangChain DeepAgents SDK.
 
-Supports chunked review: when a diff is too large, it is split by file
-and each file is reviewed independently, then results are merged.
+Uses ``create_deep_agent`` with skills support for structured code review.
+When a diff is too large it is split by file and each chunk is reviewed
+independently, then results are merged.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
 
-from langchain_openai import ChatOpenAI
+import yaml
+from deepagents import create_deep_agent
+from deepagents.backends.utils import create_file_data
+from langchain.chat_models import init_chat_model
+from langgraph.checkpoint.memory import MemorySaver
 
 from src.config import Config
 from src.exceptions import AIModelError, EmptyDiffError
@@ -21,13 +27,19 @@ from src.models import PRInfo, ReviewIssue, ReviewResult
 logger = get_logger(__name__)
 
 # Rough char limit per chunk — leaves room for prompt overhead.
-# Most models handle ~8K tokens ≈ ~24K chars comfortably.
 _MAX_DIFF_CHARS = 20_000
 
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/.+ b/.+$", re.MULTILINE)
 
-_REVIEW_PROMPT_TEMPLATE = """\
-你是一位资深代码审查专家。请对以下 Pull Request 的代码变更进行审查。
+# ---------- Default prompts (used when no YAML config is provided) ----------
+
+_DEFAULT_SYSTEM_PROMPT = (
+    "你是一位资深代码审查专家。请根据你掌握的技能，"
+    "对代码变更进行专业审查，严格按照 JSON 格式输出结果。"
+)
+
+_DEFAULT_REVIEW_USER_PROMPT = """\
+请对以下 Pull Request 的代码变更进行审查。
 
 ## PR 信息
 - 标题: {title}
@@ -40,15 +52,7 @@ _REVIEW_PROMPT_TEMPLATE = """\
 {diff}
 ```
 
-## 审查要求
-请从以下维度进行审查：
-1. 代码质量 (quality) — 代码风格、可读性、可维护性
-2. 潜在缺陷 (bug) — 逻辑错误、边界条件、空指针等
-3. 安全风险 (security) — 注入、敏感信息泄露、权限问题等
-4. 改进建议 (improvement) — 性能优化、更好的实现方式等
-
-## 输出格式
-请严格按照以下 JSON 格式输出，不要包含其他内容：
+请使用你认为合适的技能进行审查，严格按照以下 JSON 格式输出结果，不要包含其他内容：
 {{
   "summary": "审查总结（一段简短的总体评价）",
   "issues": [
@@ -64,8 +68,8 @@ _REVIEW_PROMPT_TEMPLATE = """\
 }}
 """
 
-_SUMMARY_PROMPT_TEMPLATE = """\
-你是一位资深代码审查专家。以下是对一个 Pull Request 中多个文件分别审查后的结果摘要列表。
+_DEFAULT_SUMMARY_USER_PROMPT = """\
+以下是对一个 Pull Request 中多个文件分别审查后的结果摘要列表。
 请将它们合并为一段简洁的总体审查总结（2-3 句话）。
 
 各文件审查摘要：
@@ -77,27 +81,133 @@ _SUMMARY_PROMPT_TEMPLATE = """\
 _MAX_RETRIES = 3
 _BACKOFF_SECONDS = [1, 2, 4]
 
+# Default skills directory (relative to project root)
+_DEFAULT_SKILLS_DIR = os.path.join(os.getcwd(), "skills")
+_DEFAULT_CONFIG_PATH = os.path.join(os.getcwd(), "pr-review.yaml")
+
+
+def _load_prompts(config_path: str) -> dict:
+    """Load prompt templates from the ``prompts:`` section of pr-review.yaml.
+
+    Returns a dict with keys: system_prompt, review_user_prompt,
+    summary_user_prompt.  Missing keys fall back to defaults.
+    """
+    defaults = {
+        "system_prompt": _DEFAULT_SYSTEM_PROMPT,
+        "review_user_prompt": _DEFAULT_REVIEW_USER_PROMPT,
+        "summary_user_prompt": _DEFAULT_SUMMARY_USER_PROMPT,
+    }
+    if not config_path or not os.path.isfile(config_path):
+        return defaults
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        prompts_section = data.get("prompts", {})
+        if not isinstance(prompts_section, dict):
+            return defaults
+        loaded = {k: prompts_section[k] for k in defaults if k in prompts_section}
+        result = {**defaults, **loaded}
+        logger.info(
+            "已加载 prompts 配置: %s (覆盖 %d 项)",
+            config_path,
+            len(loaded),
+        )
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取 prompts 配置失败: %s，使用默认值", exc)
+        return defaults
+
 
 class AIReviewer:
-    """AI-powered code review engine backed by LangChain ChatOpenAI.
+    """AI-powered code review engine backed by DeepAgents SDK.
 
+    Uses ``create_deep_agent()`` with skills for structured review.
     When the diff exceeds ``_MAX_DIFF_CHARS`` it is automatically split
     into per-file chunks and each chunk is reviewed independently.
     """
 
     def __init__(self, config: Config) -> None:
         self._config = config
-        kwargs: dict = {
-            "model": config.llm_model,
-            "api_key": config.llm_api_key,
-        }
-        if config.llm_base_url:
-            kwargs["base_url"] = config.llm_base_url
-        self._llm = ChatOpenAI(**kwargs, timeout=120)
+        self._skills_dir = config.skills_dir or _DEFAULT_SKILLS_DIR
+        config_path = _DEFAULT_CONFIG_PATH
+        self._prompts = _load_prompts(config_path)
         # Token usage tracking
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.total_tokens = 0
+
+    def _build_model_string(self) -> str:
+        """Build the provider:model string for init_chat_model."""
+        # If user already specified provider prefix, use as-is
+        model = self._config.llm_model
+        if ":" in model:
+            return model
+        # Default to openai-compatible provider
+        return f"openai:{model}"
+
+    def _create_agent(self):
+        """Create a fresh DeepAgents agent instance."""
+        model_kwargs = {}
+        if self._config.llm_api_key:
+            model_kwargs["api_key"] = self._config.llm_api_key
+        if self._config.llm_base_url:
+            model_kwargs["base_url"] = self._config.llm_base_url
+
+        model = init_chat_model(
+            self._build_model_string(),
+            **model_kwargs,
+        )
+
+        # Load skills files into state backend
+        skills_files = self._load_skills_files()
+
+        agent = create_deep_agent(
+            model=model,
+            system_prompt=self._prompts["system_prompt"],
+            skills=["/skills/"],
+            checkpointer=MemorySaver(),
+        )
+        return agent, skills_files
+
+    def _load_skills_files(self) -> dict:
+        """Load SKILL.md files from the skills directory into state backend format.
+
+        Only loads SKILL.md files (not all supporting files) to minimize
+        token usage. The agent can read additional skill files on demand
+        via its built-in filesystem tools.
+        """
+        skills_files = {}
+        skills_dir = self._skills_dir
+        if not os.path.isdir(skills_dir):
+            logger.warning("Skills 目录不存在: %s", skills_dir)
+            return skills_files
+
+        for entry in os.listdir(skills_dir):
+            skill_dir = os.path.join(skills_dir, entry)
+            if not os.path.isdir(skill_dir):
+                continue
+            skill_md = os.path.join(skill_dir, "SKILL.md")
+            if not os.path.isfile(skill_md):
+                continue
+            try:
+                content = open(skill_md, encoding="utf-8").read()
+                virtual_path = f"/skills/{entry}/SKILL.md"
+                skills_files[virtual_path] = create_file_data(content)
+                logger.info(
+                    "已加载 skill: %s (%d chars)",
+                    virtual_path,
+                    len(content),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("无法读取 skill 文件 %s: %s", skill_md, exc)
+
+        logger.info(
+            "Skills 加载完成: %d 个 skill, 来源目录: %s",
+            len(skills_files),
+            skills_dir,
+        )
+        return skills_files
 
     # ------------------------------------------------------------------
     # Public API
@@ -112,7 +222,6 @@ class AIReviewer:
         if len(diff) <= _MAX_DIFF_CHARS:
             return self._review_single(pr_info, diff)
 
-        # Large diff → split by file and review in chunks
         return self._review_chunked(pr_info)
 
     # ------------------------------------------------------------------
@@ -120,14 +229,14 @@ class AIReviewer:
     # ------------------------------------------------------------------
 
     def _review_single(self, pr_info: PRInfo, diff: str) -> ReviewResult:
-        prompt = _REVIEW_PROMPT_TEMPLATE.format(
+        prompt = self._prompts["review_user_prompt"].format(
             title=pr_info.title,
             description=pr_info.description,
             source_branch=pr_info.source_branch,
             target_branch=pr_info.target_branch,
             diff=diff,
         )
-        raw = self._call_llm_with_retry(prompt)
+        raw = self._call_agent_with_retry(prompt)
         return self._parse_response(raw)
 
     # ------------------------------------------------------------------
@@ -143,7 +252,6 @@ class AIReviewer:
             len(file_diffs),
         )
 
-        # Group files into chunks that fit within the char limit
         chunks = self._group_into_chunks(file_diffs)
         logger.info("分为 %d 个批次进行审查", len(chunks))
 
@@ -157,7 +265,6 @@ class AIReviewer:
             if result.summary:
                 summaries.append(result.summary)
 
-        # Merge summaries
         if len(summaries) <= 1:
             merged_summary = summaries[0] if summaries else "审查完成"
         else:
@@ -171,11 +278,9 @@ class AIReviewer:
 
     @staticmethod
     def _split_diff_by_file(diff: str) -> list[str]:
-        """Split a unified diff into per-file sections."""
         positions = [m.start() for m in _DIFF_HEADER_RE.finditer(diff)]
         if not positions:
             return [diff]
-
         sections: list[str] = []
         for i, start in enumerate(positions):
             end = positions[i + 1] if i + 1 < len(positions) else len(diff)
@@ -187,15 +292,9 @@ class AIReviewer:
         file_diffs: list[str],
         max_chars: int = _MAX_DIFF_CHARS,
     ) -> list[str]:
-        """Group per-file diffs into chunks that fit within max_chars.
-
-        A single file that exceeds max_chars is kept as its own chunk
-        (the model will do its best with truncation).
-        """
         chunks: list[str] = []
         current: list[str] = []
         current_len = 0
-
         for fd in file_diffs:
             fd_len = len(fd)
             if current and current_len + fd_len > max_chars:
@@ -204,50 +303,68 @@ class AIReviewer:
                 current_len = 0
             current.append(fd)
             current_len += fd_len
-
         if current:
             chunks.append("".join(current))
         return chunks
 
     def _merge_summaries(self, summaries: list[str]) -> str:
-        """Ask the LLM to merge multiple per-chunk summaries."""
-        numbered = "\n".join(
-            f"{i}. {s}" for i, s in enumerate(summaries, 1)
+        numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(summaries, 1))
+        prompt = self._prompts["summary_user_prompt"].format(
+            summaries=numbered,
         )
-        prompt = _SUMMARY_PROMPT_TEMPLATE.format(summaries=numbered)
         try:
-            raw = self._call_llm_with_retry(prompt)
+            raw = self._call_agent_with_retry(prompt)
             return raw.strip()
         except AIModelError:
-            # Fallback: just join them
             return " | ".join(summaries)
 
     # ------------------------------------------------------------------
-    # LLM call with retry
+    # DeepAgents invocation with retry
     # ------------------------------------------------------------------
 
-    def _call_llm_with_retry(self, prompt: str) -> str:
-        """Call the LLM with up to 3 retries and exponential backoff."""
+    def _call_agent_with_retry(self, prompt: str) -> str:
+        """Invoke the DeepAgents agent with up to 3 retries."""
         last_error: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
                 logger.info(
-                    "调用 AI 模型 (尝试 %d/%d)", attempt + 1, _MAX_RETRIES
+                    "调用 DeepAgents (尝试 %d/%d)", attempt + 1, _MAX_RETRIES
                 )
-                response = self._llm.invoke(prompt)
-                # Extract token usage from response metadata
-                usage = getattr(response, "usage_metadata", None)
+                agent, skills_files = self._create_agent()
+                thread_id = f"review-{datetime.now(timezone.utc).timestamp()}"
+                result = agent.invoke(
+                    {
+                        "messages": [{"role": "user", "content": prompt}],
+                        "files": skills_files,
+                    },
+                    config={"configurable": {"thread_id": thread_id}},
+                )
+                # Extract the final assistant message
+                messages = result.get("messages", [])
+                if not messages:
+                    raise AIModelError("DeepAgents 返回空消息")
+
+                last_msg = messages[-1]
+                content = (
+                    last_msg.content
+                    if hasattr(last_msg, "content")
+                    else str(last_msg)
+                )
+
+                # Track token usage from response metadata if available
+                usage = getattr(last_msg, "usage_metadata", None)
                 if usage:
                     self.total_prompt_tokens += usage.get("input_tokens", 0)
                     self.total_completion_tokens += usage.get("output_tokens", 0)
                     self.total_tokens += usage.get("total_tokens", 0)
-                return str(response.content)
+
+                return content
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if attempt < _MAX_RETRIES - 1:
                     wait = _BACKOFF_SECONDS[attempt]
                     logger.warning(
-                        "AI 模型调用失败，%ds 后重试: %s", wait, exc
+                        "DeepAgents 调用失败，%ds 后重试: %s", wait, exc
                     )
                     time.sleep(wait)
 
@@ -259,14 +376,20 @@ class AIReviewer:
 
     @staticmethod
     def _parse_response(raw: str) -> ReviewResult:
-        """Parse the LLM JSON response into a ReviewResult."""
+        """Parse the agent JSON response into a ReviewResult."""
         text = raw.strip()
+        # Strip markdown code fences if present
         if text.startswith("```"):
             lines = text.splitlines()
             lines = lines[1:]
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines)
+
+        # Try to extract JSON from mixed content
+        json_match = re.search(r'\{[\s\S]*\}', text)
+        if json_match:
+            text = json_match.group()
 
         try:
             data = json.loads(text)

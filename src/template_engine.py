@@ -3,11 +3,25 @@
 from __future__ import annotations
 
 import os
+import re
 
 from jinja2 import Environment, FileSystemLoader
 
 from src.exceptions import TemplateNotFoundError
 from src.models import PRInfo, ReviewDiffReport, ReviewResult
+
+
+def _linebreak_sentences(text: str) -> str:
+    """Split a dense summary into Markdown-friendly lines.
+
+    Handles numbered lists like ``1) ... 2) ...`` and Chinese
+    semicolons / periods so each point renders on its own line.
+    """
+    # Turn "1) " / "2) " style inline lists into Markdown line items
+    text = re.sub(r"\s*(\d+)\)\s*", r"\n\n\1. ", text)
+    # Also handle "；" as a sentence break
+    text = text.replace("；", "；\n\n")
+    return text.strip()
 
 
 class TemplateEngine:
@@ -51,6 +65,7 @@ class TemplateEngine:
             loader=FileSystemLoader(template_dir),
             keep_trailing_newline=True,
         )
+        env.filters["linebreak_sentences"] = _linebreak_sentences
         template = env.get_template(template_name)
 
         return template.render(

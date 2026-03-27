@@ -15,6 +15,12 @@ class TestConfigFromEnv:
         assert cfg.log_level == "INFO"
         assert cfg.review_storage_dir == ".pr_reviews"
         assert cfg.pr_review_exclude == []
+        assert cfg.skills_dir == ""
+
+    def test_skills_dir(self, monkeypatch):
+        monkeypatch.setenv("SKILLS_DIR", "/custom/skills")
+        cfg = Config.from_env(dotenv_path=_NO_DOTENV)
+        assert cfg.skills_dir == "/custom/skills"
 
     def test_loads_tokens(self, monkeypatch):
         monkeypatch.setenv("GITHUB_TOKEN", "gh_tok")

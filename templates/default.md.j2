@@ -9,7 +9,7 @@
 
 ### 📋 审查摘要
 
-{{ result.summary }}
+{{ result.summary | linebreak_sentences }}
 
 {% if excluded_files and excluded_files|length > 0 %}
 > ℹ️ 本次审查已排除 {{ excluded_files|length }} 个文件（{{ excluded_files|map(attribute='file_path')|join(', ') }}）

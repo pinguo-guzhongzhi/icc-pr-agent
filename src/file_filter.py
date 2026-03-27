@@ -111,7 +111,7 @@ class FileFilter:
 
     @staticmethod
     def load_patterns_from_config(
-        config_path: str = ".pr-review.yml",
+        config_path: str = "pr-review.yaml",
     ) -> list[str]:
         """Load exclude patterns from a YAML config file.
 

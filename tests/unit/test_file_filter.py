@@ -172,13 +172,13 @@ class TestLoadPatternsFromConfig:
         assert patterns == []
 
     def test_valid_yaml(self, tmp_path):
-        cfg = tmp_path / ".pr-review.yml"
+        cfg = tmp_path / "pr-review.yaml"
         cfg.write_text("exclude:\n  - '*.log'\n  - 'docs/**'\n")
         patterns = FileFilter.load_patterns_from_config(str(cfg))
         assert patterns == ["*.log", "docs/**"]
 
     def test_no_exclude_key(self, tmp_path):
-        cfg = tmp_path / ".pr-review.yml"
+        cfg = tmp_path / "pr-review.yaml"
         cfg.write_text("other_key: value\n")
         patterns = FileFilter.load_patterns_from_config(str(cfg))
         assert patterns == []
