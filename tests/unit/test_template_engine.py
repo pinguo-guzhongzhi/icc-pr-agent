@@ -10,6 +10,7 @@ from src.models import (
     ReviewDiffReport,
     ReviewIssue,
     ReviewResult,
+    TokenUsageByGroup,
 )
 from src.template_engine import TemplateEngine
 
@@ -167,3 +168,54 @@ class TestTemplateEngine:
     def test_default_template_path_value(self) -> None:
         expected = os.path.join("templates", "default.md.j2")
         assert TemplateEngine.DEFAULT_TEMPLATE_PATH == expected
+
+
+class TestTemplateEngineTokenUsageByGroup:
+    """Tests for token_usage_by_group rendering in template."""
+
+    def setup_method(self) -> None:
+        self.engine = TemplateEngine()
+
+    def test_render_with_token_usage_by_group(self) -> None:
+        """Requirement 11.3: template shows per-group token usage."""
+        token_usage = {
+            "prompt_tokens": 7000,
+            "completion_tokens": 4300,
+            "total_tokens": 11300,
+        }
+        usage_by_group = [
+            TokenUsageByGroup("backend", 5000, 3200, 8200),
+            TokenUsageByGroup("frontend", 2000, 1100, 3100),
+        ]
+        output = self.engine.render(
+            _review_result(), _pr_info(),
+            token_usage=token_usage,
+            token_usage_by_group=usage_by_group,
+        )
+        assert "backend" in output
+        assert "8,200" in output
+        assert "frontend" in output
+        assert "3,100" in output
+
+    def test_render_without_token_usage_by_group(self) -> None:
+        """When no group usage, template renders without group section."""
+        token_usage = {
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150,
+        }
+        output = self.engine.render(
+            _review_result(), _pr_info(),
+            token_usage=token_usage,
+            token_usage_by_group=None,
+        )
+        # Should still render token usage but no group breakdown
+        assert "150" in output
+
+    def test_render_no_token_usage_at_all(self) -> None:
+        """When no token usage at all, template renders cleanly."""
+        output = self.engine.render(
+            _review_result(), _pr_info(),
+        )
+        # Should not crash, just no token info
+        assert "AI" in output  # The footer mentions AI

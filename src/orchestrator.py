@@ -128,6 +128,7 @@ class ReviewOrchestrator:
             options.template_path,
             filter_result.excluded_files,
             token_usage=token_usage,
+            token_usage_by_group=self._ai_reviewer.token_usage_by_group or None,
         )
 
         # m. Save record
@@ -169,4 +170,8 @@ class ReviewOrchestrator:
             diff_report=diff_report,
             formatted_comment=formatted_comment,
             written_back=written_back,
+            prompt_tokens=self._ai_reviewer.total_prompt_tokens,
+            completion_tokens=self._ai_reviewer.total_completion_tokens,
+            total_tokens=self._ai_reviewer.total_tokens,
+            token_usage_by_group=self._ai_reviewer.token_usage_by_group or None,
         )

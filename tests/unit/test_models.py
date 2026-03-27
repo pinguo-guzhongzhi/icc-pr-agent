@@ -1,13 +1,19 @@
 """Unit tests for core data models."""
 
 from src.models import (
+    Batch,
+    FileGroup,
     FilterResult,
     PRInfo,
     ReviewDiffReport,
     ReviewIssue,
     ReviewOptions,
+    ReviewOutput,
     ReviewRecord,
     ReviewResult,
+    SubAgentResult,
+    SymbolEntry,
+    TokenUsageByGroup,
 )
 
 
@@ -160,3 +166,177 @@ class TestFilterResult:
         )
         assert fr.included_file_count == 5
         assert len(fr.excluded_files) == 1
+
+
+class TestFileGroup:
+    def test_creation(self):
+        fg = FileGroup(
+            name="backend",
+            file_paths=["src/main.go", "api/user.proto"],
+            file_diffs=["diff1", "diff2"],
+            total_chars=100,
+        )
+        assert fg.name == "backend"
+        assert fg.file_paths == ["src/main.go", "api/user.proto"]
+        assert fg.file_diffs == ["diff1", "diff2"]
+        assert fg.total_chars == 100
+
+    def test_empty_group(self):
+        fg = FileGroup(name="empty", file_paths=[], file_diffs=[], total_chars=0)
+        assert fg.file_paths == []
+        assert fg.total_chars == 0
+
+
+class TestBatch:
+    def test_creation(self):
+        batch = Batch(
+            group_name="backend",
+            batch_index=0,
+            file_paths=["src/main.go"],
+            diff_content="diff content here",
+            char_count=17,
+        )
+        assert batch.group_name == "backend"
+        assert batch.batch_index == 0
+        assert batch.file_paths == ["src/main.go"]
+        assert batch.diff_content == "diff content here"
+        assert batch.char_count == 17
+
+    def test_second_batch(self):
+        batch = Batch(
+            group_name="frontend",
+            batch_index=1,
+            file_paths=["app.tsx", "style.css"],
+            diff_content="more diff",
+            char_count=9,
+        )
+        assert batch.batch_index == 1
+        assert len(batch.file_paths) == 2
+
+
+class TestSymbolEntry:
+    def test_creation(self):
+        entry = SymbolEntry(
+            name="CreateOrder",
+            signature="func (s *OrderService) CreateOrder(ctx context.Context) error",
+            file_path="internal/service/order.go",
+            line_number=42,
+            kind="method",
+            language="go",
+        )
+        assert entry.name == "CreateOrder"
+        assert entry.kind == "method"
+        assert entry.language == "go"
+        assert entry.line_number == 42
+
+    def test_proto_entry(self):
+        entry = SymbolEntry(
+            name="UserService",
+            signature="service UserService { ... }",
+            file_path="api/user.proto",
+            line_number=10,
+            kind="service",
+            language="proto",
+        )
+        assert entry.kind == "service"
+        assert entry.language == "proto"
+
+
+class TestSubAgentResult:
+    def test_successful_result(self):
+        review = ReviewResult(
+            summary="Found 1 issue",
+            issues=[],
+            reviewed_at="2024-01-15T10:30:00Z",
+        )
+        result = SubAgentResult(
+            group_name="backend",
+            batch_index=0,
+            result=review,
+            error=None,
+            prompt_tokens=500,
+            completion_tokens=300,
+            total_tokens=800,
+            elapsed_seconds=2.5,
+        )
+        assert result.group_name == "backend"
+        assert result.result is not None
+        assert result.error is None
+        assert result.total_tokens == 800
+        assert result.elapsed_seconds == 2.5
+
+    def test_failed_result(self):
+        result = SubAgentResult(
+            group_name="frontend",
+            batch_index=1,
+            result=None,
+            error="Timeout after 300s",
+        )
+        assert result.result is None
+        assert result.error == "Timeout after 300s"
+
+    def test_defaults(self):
+        result = SubAgentResult(
+            group_name="infra",
+            batch_index=0,
+            result=None,
+            error=None,
+        )
+        assert result.prompt_tokens == 0
+        assert result.completion_tokens == 0
+        assert result.total_tokens == 0
+        assert result.elapsed_seconds == 0.0
+
+
+class TestTokenUsageByGroup:
+    def test_creation(self):
+        usage = TokenUsageByGroup(
+            group_name="backend",
+            prompt_tokens=5000,
+            completion_tokens=3200,
+            total_tokens=8200,
+        )
+        assert usage.group_name == "backend"
+        assert usage.prompt_tokens == 5000
+        assert usage.completion_tokens == 3200
+        assert usage.total_tokens == 8200
+
+
+class TestReviewOutput:
+    def test_backward_compatibility_default_none(self):
+        """token_usage_by_group defaults to None for backward compatibility."""
+        output = ReviewOutput(
+            review_result=ReviewResult(
+                summary="OK", issues=[], reviewed_at="2024-01-15T10:30:00Z"
+            ),
+            diff_report=None,
+            formatted_comment="comment",
+            written_back=True,
+        )
+        assert output.token_usage_by_group is None
+        assert output.prompt_tokens == 0
+        assert output.completion_tokens == 0
+        assert output.total_tokens == 0
+
+    def test_with_token_usage_by_group(self):
+        usage = [
+            TokenUsageByGroup("backend", 5000, 3200, 8200),
+            TokenUsageByGroup("frontend", 2000, 1100, 3100),
+        ]
+        output = ReviewOutput(
+            review_result=ReviewResult(
+                summary="Found issues", issues=[], reviewed_at="2024-01-15T10:30:00Z"
+            ),
+            diff_report=None,
+            formatted_comment="comment",
+            written_back=True,
+            prompt_tokens=7000,
+            completion_tokens=4300,
+            total_tokens=11300,
+            token_usage_by_group=usage,
+        )
+        assert output.token_usage_by_group is not None
+        assert len(output.token_usage_by_group) == 2
+        assert output.token_usage_by_group[0].group_name == "backend"
+        assert output.token_usage_by_group[1].total_tokens == 3100
+        assert output.total_tokens == 11300

@@ -16,6 +16,8 @@ dependencies = [
     "pyyaml>=6.0",
     "fastapi>=0.115",
     "uvicorn>=0.32",
+    "tree-sitter>=0.21",
+    "tree-sitter-languages>=1.10",
 ]
 
 [project.optional-dependencies]
@@ -35,3 +37,12 @@ addopts = "-v --tb=short"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "W", "F"]
+
+[tool.flake8]
+max-line-length = 120

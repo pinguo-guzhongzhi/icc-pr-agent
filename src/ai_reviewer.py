@@ -3,6 +3,10 @@
 Uses ``create_deep_agent`` with skills support for structured code review.
 When a diff is too large it is split by file and each chunk is reviewed
 independently, then results are merged.
+
+Sub-agent architecture: when ``file_groups`` is configured (or the diff
+exceeds the context window), the engine delegates review to per-group
+sub-agents running concurrently.
 """
 
 from __future__ import annotations
@@ -11,18 +15,32 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import yaml
 from deepagents import create_deep_agent
 from deepagents.backends.utils import create_file_data
 from langchain.chat_models import init_chat_model
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 
+from src.batch_splitter import BatchSplitter
 from src.config import Config
-from src.exceptions import AIModelError, EmptyDiffError
+from src.context_detector import ContextWindowDetector
+from src.exceptions import AIModelError, EmptyDiffError, SubAgentTimeoutError
+from src.file_grouper import FileGrouper
 from src.logger import get_logger
-from src.models import PRInfo, ReviewIssue, ReviewResult
+from src.models import (
+    Batch,
+    PRInfo,
+    ReviewIssue,
+    ReviewResult,
+    SubAgentResult,
+    TokenUsageByGroup,
+)
+from src.result_merger import ResultMerger
+from src.symbol_indexer import SymbolIndex, SymbolIndexer
 
 logger = get_logger(__name__)
 
@@ -123,8 +141,9 @@ class AIReviewer:
     """AI-powered code review engine backed by DeepAgents SDK.
 
     Uses ``create_deep_agent()`` with skills for structured review.
-    When the diff exceeds ``_MAX_DIFF_CHARS`` it is automatically split
-    into per-file chunks and each chunk is reviewed independently.
+    Supports two paths:
+    - Single Agent fast path: small diff with no file_groups config
+    - Sub-agent path: delegates to per-group sub-agents for large/grouped diffs
     """
 
     def __init__(self, config: Config) -> None:
@@ -132,34 +151,42 @@ class AIReviewer:
         self._skills_dir = config.skills_dir or _DEFAULT_SKILLS_DIR
         config_path = _DEFAULT_CONFIG_PATH
         self._prompts = _load_prompts(config_path)
-        # Token usage tracking
+        # Token usage tracking (backward compatible)
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.total_tokens = 0
+        # Token budget circuit-breaker (0 = unlimited)
+        self._token_budget = config.token_budget
+        # Sub-agent components
+        self._file_grouper = FileGrouper(config.file_groups) if config.file_groups else None
+        self._result_merger = ResultMerger()
+        # Per-group token usage (populated after sub-agent review)
+        self._token_usage_by_group: list[TokenUsageByGroup] = []
+
+    @property
+    def token_usage_by_group(self) -> list[TokenUsageByGroup]:
+        """Per-group token consumption after sub-agent review."""
+        return self._token_usage_by_group
 
     def _build_model_string(self) -> str:
         """Build the provider:model string for init_chat_model."""
-        # If user already specified provider prefix, use as-is
         model = self._config.llm_model
         if ":" in model:
             return model
-        # Default to openai-compatible provider
         return f"openai:{model}"
 
-    def _create_agent(self):
-        """Create a fresh DeepAgents agent instance."""
+    def _create_model(self):
+        """Create a LangChain chat model instance."""
         model_kwargs = {}
         if self._config.llm_api_key:
             model_kwargs["api_key"] = self._config.llm_api_key
         if self._config.llm_base_url:
             model_kwargs["base_url"] = self._config.llm_base_url
+        return init_chat_model(self._build_model_string(), **model_kwargs)
 
-        model = init_chat_model(
-            self._build_model_string(),
-            **model_kwargs,
-        )
-
-        # Load skills files into state backend
+    def _create_agent(self):
+        """Create a fresh DeepAgents agent instance."""
+        model = self._create_model()
         skills_files = self._load_skills_files()
 
         agent = create_deep_agent(
@@ -171,12 +198,7 @@ class AIReviewer:
         return agent, skills_files
 
     def _load_skills_files(self) -> dict:
-        """Load SKILL.md files from the skills directory into state backend format.
-
-        Only loads SKILL.md files (not all supporting files) to minimize
-        token usage. The agent can read additional skill files on demand
-        via its built-in filesystem tools.
-        """
+        """Load SKILL.md files from the skills directory into state backend format."""
         skills_files = {}
         skills_dir = self._skills_dir
         if not os.path.isdir(skills_dir):
@@ -214,18 +236,38 @@ class AIReviewer:
     # ------------------------------------------------------------------
 
     def review(self, pr_info: PRInfo) -> ReviewResult:
-        """Review PR code changes and return structured results."""
+        """Review PR code changes and return structured results.
+
+        Decision logic:
+        - No file_groups config + diff <= max_chunk_chars → single Agent fast path
+        - Otherwise → sub-agent path
+        """
         if not pr_info.diff or not pr_info.diff.strip():
             raise EmptyDiffError("无代码变更，无需审查")
 
         diff = pr_info.diff
-        if len(diff) <= _MAX_DIFF_CHARS:
+
+        # Determine max_chunk_chars for the decision
+        model = self._create_model()
+        max_chunk_chars = ContextWindowDetector.detect(
+            model, self._config.max_chunk_chars,
+        )
+
+        # Decision: single Agent fast path vs sub-agent path
+        has_file_groups = self._config.file_groups is not None
+        if not has_file_groups and len(diff) <= max_chunk_chars:
+            # Single Agent fast path (backward compatible)
             return self._review_single(pr_info, diff)
 
-        return self._review_chunked(pr_info)
+        if not has_file_groups and len(diff) > max_chunk_chars:
+            # Large diff but no file_groups → use legacy chunked path
+            return self._review_chunked(pr_info)
+
+        # Sub-agent path
+        return self._review_with_subagents(pr_info, max_chunk_chars)
 
     # ------------------------------------------------------------------
-    # Single-pass review (small diff)
+    # Single-pass review (small diff) — fast path
     # ------------------------------------------------------------------
 
     def _review_single(self, pr_info: PRInfo, diff: str) -> ReviewResult:
@@ -240,7 +282,7 @@ class AIReviewer:
         return self._parse_response(raw)
 
     # ------------------------------------------------------------------
-    # Chunked review (large diff)
+    # Chunked review (large diff, no file_groups) — legacy fast path
     # ------------------------------------------------------------------
 
     def _review_chunked(self, pr_info: PRInfo) -> ReviewResult:
@@ -264,6 +306,21 @@ class AIReviewer:
             all_issues.extend(result.issues)
             if result.summary:
                 summaries.append(result.summary)
+
+            # Circuit-breaker: stop after saving this batch's results
+            if self._token_budget > 0 and self.total_tokens >= self._token_budget:
+                logger.warning(
+                    "Token 预算熔断: 已用 %d, 预算 %d, "
+                    "跳过剩余 %d 个批次",
+                    self.total_tokens,
+                    self._token_budget,
+                    len(chunks) - idx,
+                )
+                summaries.append(
+                    f"⚠️ Token 预算熔断（已用 {self.total_tokens}/"
+                    f"{self._token_budget}），部分文件未审查。"
+                )
+                break
 
         if len(summaries) <= 1:
             merged_summary = summaries[0] if summaries else "审查完成"
@@ -317,6 +374,336 @@ class AIReviewer:
             return raw.strip()
         except AIModelError:
             return " | ".join(summaries)
+
+    # ------------------------------------------------------------------
+    # Sub-agent review path (Task 11.2)
+    # ------------------------------------------------------------------
+
+    def _review_with_subagents(
+        self, pr_info: PRInfo, max_chunk_chars: int,
+    ) -> ReviewResult:
+        """Sub-agent review path.
+
+        1. Group files via FileGrouper
+        2. Split each group into batches via BatchSplitter
+        3. Optionally build SymbolIndex
+        4. Execute sub-agent tasks concurrently
+        5. Merge results via ResultMerger
+        """
+        # File grouping
+        grouper = self._file_grouper or FileGrouper()
+        file_groups = grouper.group(pr_info.diff)
+        logger.info(
+            "文件分组完成: %d 个分组 (%s)",
+            len(file_groups),
+            ", ".join(f"{k}:{len(v.file_paths)}files" for k, v in file_groups.items()),
+        )
+
+        # Batch splitting
+        splitter = BatchSplitter()
+        all_batches: list[Batch] = []
+        for group in file_groups.values():
+            batches = splitter.split(group, max_chunk_chars)
+            all_batches.extend(batches)
+        logger.info("共生成 %d 个审查批次", len(all_batches))
+
+        # Optional symbol index
+        symbol_index = self._build_symbol_index(pr_info)
+
+        # Concurrent sub-agent execution
+        max_concurrency = self._config.max_concurrency
+        sub_results: list[SubAgentResult] = []
+        budget_exceeded = False
+
+        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+            futures = {
+                executor.submit(
+                    self._create_subagent_task,
+                    batch.group_name,
+                    batch,
+                    symbol_index,
+                    pr_info,
+                ): batch
+                for batch in all_batches
+            }
+            for future in as_completed(futures):
+                batch = futures[future]
+                try:
+                    result = future.result()
+                    sub_results.append(result)
+
+                    # Accumulate tokens and check budget
+                    self.total_prompt_tokens += result.prompt_tokens
+                    self.total_completion_tokens += result.completion_tokens
+                    self.total_tokens += result.total_tokens
+
+                    if (
+                        self._token_budget > 0
+                        and self.total_tokens >= self._token_budget
+                    ):
+                        budget_exceeded = True
+                        logger.warning(
+                            "Token 预算熔断: 已用 %d, 预算 %d, "
+                            "取消剩余 %d 个批次",
+                            self.total_tokens,
+                            self._token_budget,
+                            len(futures) - len(sub_results),
+                        )
+                        # Cancel remaining futures
+                        for f in futures:
+                            f.cancel()
+                        break
+
+                except Exception as exc:
+                    logger.error(
+                        "Sub-agent task failed: group=%s batch=%d error=%s",
+                        batch.group_name, batch.batch_index, exc,
+                    )
+                    sub_results.append(SubAgentResult(
+                        group_name=batch.group_name,
+                        batch_index=batch.batch_index,
+                        result=None,
+                        error=str(exc),
+                    ))
+
+        # Merge results
+        merged = self._result_merger.merge(
+            sub_results, max_issues=self._config.max_issues,
+        )
+
+        # If budget exceeded, annotate the summary
+        if budget_exceeded:
+            merged = ReviewResult(
+                summary=(
+                    f"⚠️ Token 预算熔断（已用 {self.total_tokens}/"
+                    f"{self._token_budget}），部分文件未审查。"
+                    f"\n\n{merged.summary}"
+                ),
+                issues=merged.issues,
+                reviewed_at=merged.reviewed_at,
+            )
+
+        # Aggregate token usage by group
+        self._token_usage_by_group = ResultMerger.aggregate_token_usage(sub_results)
+
+        return merged
+
+    def _build_symbol_index(self, pr_info: PRInfo) -> SymbolIndex | None:
+        """Optionally build symbol index. Returns None on failure."""
+        try:
+            indexer = SymbolIndexer(
+                cache_dir=self._config.review_storage_dir,
+            )
+            # Extract repo URL and branch from pr_info
+            repo_url = self._extract_repo_url(pr_info)
+            if not repo_url:
+                logger.warning("无法从 PR 信息中提取仓库 URL，跳过符号索引构建")
+                return None
+
+            # Extract changed file paths from diff
+            changed_files = self._extract_changed_files(pr_info.diff)
+
+            index = indexer.build(
+                repo_url=repo_url,
+                branch=pr_info.target_branch,
+                changed_files=changed_files,
+            )
+            logger.info("符号索引构建完成: %d 条记录", len(index.entries))
+            return index
+        except Exception as exc:
+            logger.warning("符号索引构建失败，子 Agent 将不提供 lookup_symbol tool: %s", exc)
+            return None
+
+    @staticmethod
+    def _extract_repo_url(pr_info: PRInfo) -> str | None:
+        """Extract clone URL from PR URL."""
+        # GitHub: https://github.com/owner/repo/pull/42 → https://github.com/owner/repo.git
+        if "github.com" in pr_info.pr_url:
+            m = re.match(r"(https://github\.com/[^/]+/[^/]+)", pr_info.pr_url)
+            if m:
+                return m.group(1) + ".git"
+        return None
+
+    @staticmethod
+    def _extract_changed_files(diff: str) -> list[str]:
+        """Extract file paths from diff headers."""
+        paths = []
+        for m in re.finditer(r"^diff --git a/.+ b/(.+)$", diff, re.MULTILINE):
+            paths.append(m.group(1))
+        return paths
+
+    # ------------------------------------------------------------------
+    # Sub-agent task creation (Task 11.3)
+    # ------------------------------------------------------------------
+
+    def _create_subagent_task(
+        self,
+        group_name: str,
+        batch: Batch,
+        symbol_index: SymbolIndex | None,
+        pr_info: PRInfo,
+    ) -> SubAgentResult:
+        """Create and execute a single sub-agent review task with timeout protection."""
+        start_time = time.monotonic()
+        try:
+            model = self._create_model()
+            skills_files = self._load_skills_files()
+
+            # Build sub-agent system prompt with group context
+            sub_system_prompt = (
+                f"你是负责审查 {group_name} 分组代码的专家子 Agent。\n"
+                f"你正在审查的文件属于 {group_name} 领域。\n"
+                f"请根据你掌握的技能，对代码变更进行专业审查，"
+                f"严格按照 JSON 格式输出结果。"
+            )
+
+            # Build tools for sub-agent
+            tools = []
+            if symbol_index is not None:
+                lookup_tool = self._build_lookup_symbol_tool(symbol_index)
+                tools.append(lookup_tool)
+
+            # Create sub-agent using DeepAgents SDK
+            sub_agent = create_deep_agent(
+                model=model,
+                system_prompt=sub_system_prompt,
+                skills=["/skills/"],
+                tools=tools,
+                checkpointer=MemorySaver(),
+            )
+
+            # Build review prompt
+            prompt = self._prompts["review_user_prompt"].format(
+                title=pr_info.title,
+                description=pr_info.description,
+                source_branch=pr_info.source_branch,
+                target_branch=pr_info.target_branch,
+                diff=batch.diff_content,
+            )
+
+            thread_id = (
+                f"review-{group_name}-{batch.batch_index}-"
+                f"{datetime.now(timezone.utc).timestamp()}"
+            )
+
+            # Execute with timeout protection
+            timeout = self._config.review_timeout
+            import concurrent.futures
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    sub_agent.invoke,
+                    {
+                        "messages": [{"role": "user", "content": prompt}],
+                        "files": skills_files,
+                    },
+                    config={"configurable": {"thread_id": thread_id}},
+                )
+                try:
+                    result = future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    future.cancel()
+                    elapsed = time.monotonic() - start_time
+                    error_msg = f"{group_name} 组审查超时（{timeout}s），已跳过"
+                    logger.error(error_msg)
+                    return SubAgentResult(
+                        group_name=group_name,
+                        batch_index=batch.batch_index,
+                        result=None,
+                        error=error_msg,
+                        elapsed_seconds=elapsed,
+                    )
+
+            # Parse response
+            messages = result.get("messages", [])
+            if not messages:
+                raise AIModelError("Sub-agent 返回空消息")
+
+            last_msg = messages[-1]
+            content = (
+                last_msg.content
+                if hasattr(last_msg, "content")
+                else str(last_msg)
+            )
+
+            # Track token usage
+            prompt_tokens = 0
+            completion_tokens = 0
+            total_tokens_val = 0
+            usage = getattr(last_msg, "usage_metadata", None)
+            if usage:
+                prompt_tokens = usage.get("input_tokens", 0)
+                completion_tokens = usage.get("output_tokens", 0)
+                total_tokens_val = usage.get("total_tokens", 0)
+
+            elapsed = time.monotonic() - start_time
+            review_result = self._parse_response(content)
+
+            return SubAgentResult(
+                group_name=group_name,
+                batch_index=batch.batch_index,
+                result=review_result,
+                error=None,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens_val,
+                elapsed_seconds=elapsed,
+            )
+
+        except SubAgentTimeoutError:
+            raise
+        except Exception as exc:
+            elapsed = time.monotonic() - start_time
+            logger.error(
+                "Sub-agent 审查异常: group=%s batch=%d error=%s",
+                group_name, batch.batch_index, exc,
+            )
+            return SubAgentResult(
+                group_name=group_name,
+                batch_index=batch.batch_index,
+                result=None,
+                error=str(exc),
+                elapsed_seconds=elapsed,
+            )
+
+    # ------------------------------------------------------------------
+    # lookup_symbol tool builder (Task 11.4)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_lookup_symbol_tool(symbol_index: SymbolIndex):
+        """Build a lookup_symbol tool for sub-agents.
+
+        The tool queries the SymbolIndex by symbol name and optional file_hint.
+        Returns symbol signature, file path, and line number when found.
+        Returns "symbol not found in project" when not found.
+        """
+
+        @tool
+        def lookup_symbol(name: str, file_hint: str = "") -> str:
+            """查询项目内部符号的签名信息。
+
+            Args:
+                name: 符号名称（函数名、类名、方法名等）
+                file_hint: 可选的文件路径提示，用于缩小查询范围
+
+            Returns:
+                符号的签名、文件路径和行号信息，或"符号未在项目内部找到"提示
+            """
+            hint = file_hint if file_hint else None
+            entries = symbol_index.lookup(name, file_hint=hint)
+            if not entries:
+                return f"符号 '{name}' 未在项目内部找到（可能是第三方库的符号）"
+
+            results = []
+            for entry in entries:
+                results.append(
+                    f"- {entry.kind} {entry.name}: {entry.signature}\n"
+                    f"  文件: {entry.file_path}, 行号: {entry.line_number}, "
+                    f"语言: {entry.language}"
+                )
+            return "\n".join(results)
+
+        return lookup_symbol
 
     # ------------------------------------------------------------------
     # DeepAgents invocation with retry

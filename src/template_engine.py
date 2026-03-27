@@ -8,7 +8,7 @@ import re
 from jinja2 import Environment, FileSystemLoader
 
 from src.exceptions import TemplateNotFoundError
-from src.models import PRInfo, ReviewDiffReport, ReviewResult
+from src.models import PRInfo, ReviewDiffReport, ReviewResult, TokenUsageByGroup
 
 
 def _linebreak_sentences(text: str) -> str:
@@ -37,6 +37,7 @@ class TemplateEngine:
         template_path: str | None = None,
         excluded_files: list[dict] | None = None,
         token_usage: dict | None = None,
+        token_usage_by_group: list[TokenUsageByGroup] | None = None,
     ) -> str:
         """Render review result using a Jinja2 template.
 
@@ -74,4 +75,5 @@ class TemplateEngine:
             diff_report=diff_report,
             excluded_files=excluded_files,
             token_usage=token_usage,
+            token_usage_by_group=token_usage_by_group,
         )

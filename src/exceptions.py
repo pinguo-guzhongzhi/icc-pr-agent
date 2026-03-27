@@ -39,3 +39,22 @@ class AllFilesExcludedError(PRReviewError):
 
 class ExcludeConfigError(PRReviewError):
     """Exclude configuration file has an invalid format."""
+
+
+class SymbolIndexError(PRReviewError):
+    """符号索引构建或查询失败。"""
+
+
+class SubAgentTimeoutError(PRReviewError):
+    """子 Agent 审查超时。"""
+
+
+class TokenBudgetExceededError(PRReviewError):
+    """单次 PR 审查的 token 消耗超出预算，触发熔断。"""
+
+    def __init__(self, budget: int, used: int, message: str = "") -> None:
+        self.budget = budget
+        self.used = used
+        super().__init__(
+            message or f"Token 预算已耗尽: 已用 {used}, 预算 {budget}"
+        )

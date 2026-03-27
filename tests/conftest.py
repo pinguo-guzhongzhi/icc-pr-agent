@@ -22,6 +22,10 @@ def clean_env(monkeypatch):
         "WEBHOOK_SECRET_GITHUB",
         "WEBHOOK_SECRET_GITLAB",
         "WEBHOOK_SECRET_CODEUP",
+        "MAX_REVIEW_ISSUES",
+        "MAX_REVIEW_CONCURRENCY",
+        "REVIEW_TIMEOUT",
+        "SKILLS_DIR",
     ]
     for key in env_keys:
         monkeypatch.delenv(key, raising=False)

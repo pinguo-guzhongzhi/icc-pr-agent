@@ -151,6 +151,63 @@ class ReviewOptions:
 
 
 @dataclass
+class FileGroup:
+    """文件关联域分组。"""
+
+    name: str
+    file_paths: list[str]
+    file_diffs: list[str]
+    total_chars: int
+
+
+@dataclass
+class Batch:
+    """组内二次分片批次。"""
+
+    group_name: str
+    batch_index: int
+    file_paths: list[str]
+    diff_content: str
+    char_count: int
+
+
+@dataclass
+class SymbolEntry:
+    """符号索引条目。"""
+
+    name: str
+    signature: str
+    file_path: str
+    line_number: int
+    kind: str  # "function" | "method" | "interface" | "struct" | "class" | "service" | "rpc" | "message"
+    language: str  # "go" | "proto" | "typescript" | "python"
+
+
+@dataclass
+class SubAgentResult:
+    """子 Agent 审查结果。"""
+
+    group_name: str
+    batch_index: int
+    result: ReviewResult | None
+    error: str | None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    elapsed_seconds: float = 0.0
+
+
+@dataclass
+class TokenUsageByGroup:
+    """分组维度 token 消耗。"""
+
+    group_name: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+@dataclass
 class ReviewOutput:
     """Output of a complete review run."""
 
@@ -161,6 +218,7 @@ class ReviewOutput:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    token_usage_by_group: list[TokenUsageByGroup] | None = None
 
 
 @dataclass
