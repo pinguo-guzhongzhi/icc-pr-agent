@@ -74,6 +74,7 @@ class GitHubAdapter(PlatformAdapter):
                     headers=hdrs,
                     json=json,
                     timeout=30,
+                    follow_redirects=True,
                 )
                 elapsed = time.monotonic() - start
                 logger.info(
