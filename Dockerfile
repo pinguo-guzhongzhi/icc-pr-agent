@@ -2,7 +2,7 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 COPY pyproject.toml .
-RUN pip install --no-cache-dir --prefix=/install \
+RUN pip install --no-cache-dir --progress-bar off --prefix=/install \
     -i https://mirrors.aliyun.com/pypi/simple/ \
     --trusted-host mirrors.aliyun.com .
 
