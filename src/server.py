@@ -39,24 +39,26 @@ _record_store: RecordStore | None = None
 # Serial review queue — one review at a time
 _review_queue: asyncio.Queue[GitHubWebhookEvent] = asyncio.Queue()
 _worker_task: asyncio.Task | None = None
+# Single dedicated thread for blocking review work — avoids default executor
+# and prevents "can't start new thread" in resource-constrained containers.
+_review_executor: ThreadPoolExecutor | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _config, _orchestrator, _record_store, _worker_task
+    global _config, _orchestrator, _record_store, _worker_task, _review_executor
     _config = Config.from_env()
     _orchestrator = ReviewOrchestrator(_config)
     _record_store = RecordStore(_config.review_storage_dir)
-    # Limit the default executor to avoid "can't start new thread" in containers.
-    # Sub-agent concurrency already uses its own pool, so 1 thread here is enough.
-    loop = asyncio.get_running_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    _review_executor = ThreadPoolExecutor(max_workers=1)
     _worker_task = asyncio.create_task(_review_worker())
     logger.info("Server started")
     yield
-    # Shutdown: cancel worker
+    # Shutdown: cancel worker, shut down executor
     if _worker_task:
         _worker_task.cancel()
+    if _review_executor:
+        _review_executor.shutdown(wait=False)
     logger.info("Server shutting down")
 
 
